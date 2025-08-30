@@ -1,4 +1,6 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
+
+
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import os
 import asyncio
@@ -22,17 +24,44 @@ try:
     if not firebase_admin._apps:
         # Try to use service account key file
         if os.path.exists('serviceAccountKey.json'):
+            print("🔧 Loading Firebase credentials from serviceAccountKey.json")
             cred = credentials.Certificate('serviceAccountKey.json')
             firebase_admin.initialize_app(cred)
+            print("✅ Firebase Admin SDK initialized with service account")
         else:
-            # Fallback to default credentials
+            print("⚠️ serviceAccountKey.json not found, trying environment variables")
+            # Try environment variables
+            cred_dict = {
+                "type": os.getenv('FIREBASE_TYPE'),
+                "project_id": os.getenv('FIREBASE_PROJECT_ID'),
+                "private_key_id": os.getenv('FIREBASE_PRIVATE_KEY_ID'),
+                "private_key": os.getenv('FIREBASE_PRIVATE_KEY', '').replace('\\n', '\n'),
+                "client_email": os.getenv('FIREBASE_CLIENT_EMAIL'),
+                "client_id": os.getenv('FIREBASE_CLIENT_ID'),
+                "auth_uri": os.getenv('FIREBASE_AUTH_URI'),
+                "token_uri": os.getenv('FIREBASE_TOKEN_URI'),
+                "auth_provider_x509_cert_url": os.getenv('FIREBASE_AUTH_PROVIDER_X509_CERT_URL'),
+                "client_x509_cert_url": os.getenv('FIREBASE_CLIENT_X509_CERT_URL')
+            }
+            
+            # Check if all required fields are present
+            if all(cred_dict.values()):
+                print("🔧 Loading Firebase credentials from environment variables")
+                cred = credentials.Certificate(cred_dict)
+                firebase_admin.initialize_app(cred)
+                print("✅ Firebase Admin SDK initialized with environment variables")
+            else:
+                print("❌ Neither serviceAccountKey.json nor environment variables found")
             firebase_admin.initialize_app()
+            print("⚠️ Using default Firebase credentials")
     
     # Initialize Firestore client
     db = firestore.client()
     print(f"✅ Firebase connected successfully")
+    print(f"🔗 Project ID: {db.project}")
 except Exception as e:
     print(f"❌ Firebase connection failed: {e}")
+    print(f"🔍 Error details: {type(e).__name__}")
     db = None
 
 # Rate limiting for security
@@ -523,24 +552,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"🔍 Existing referrals for user {user_id}: {len(existing_referrals)}")
                 
                 if not existing_referrals:
-                    # Create new referral record with pending status - FIXED: Match frontend structure
+                    # Create new referral record with pending status
                     referral_data = {
-                        'referrer_id': str(referrer_id),  # FIXED: Convert to string
-                        'referred_id': str(user_id),      # FIXED: Convert to string
-                        'status': 'pending',              # FIXED: Use frontend status values
+                        'referrer_id': str(referrer_id),
+                        'referred_id': str(user_id),
+                        'status': 'pending_group_join',
                         'referral_code': referral_code,
                         'auto_start_triggered': True,
                         'created_at': datetime.now(),
-                        'reward_amount': 2,               # FIXED: Use frontend field name
-                        'reward_given': False,            # FIXED: Use frontend field name
+                        'bonus_amount': 0,
                         'is_active': True,
                         'rejoin_count': 0,
-                        'group_join_verified': False,
-                        # Keep bot-specific fields for enhanced functionality
-                        'bonus_amount': 0,                # Keep for backward compatibility
-                        'group_join_date': None,
-                        'last_join_date': None,
-                        'last_rejoin_date': None
+                        'group_join_verified': False
                     }
                     
                     print(f"📝 Creating referral with data: {referral_data}")
@@ -614,6 +637,189 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if existing_referrals:
                     referral_doc = existing_referrals[0]
+                    referral = referral_doc.to_dict()
+                    referrer_id = referral['referrer_id']
+
+                    # Check if this is a rejoin attempt (user was already verified and rewarded)
+                    if referral.get('status') == 'verified' and referral.get('reward_given', False):
+                        print(f"⚠️ Rejoin attempt detected: {referrer_id} → {user_id}")
+                        # Increment rejoin count and send warning
+                        current_rejoin_count = referral.get('rejoin_count', 0)
+                        referral_doc.reference.update({
+                            'rejoin_count': current_rejoin_count + 1,
+                            'last_rejoin_date': datetime.now(),
+                            'updated_at': datetime.now()
+                        })
+
+                        # Send warning to user about rejoin attempt
+                        warning_message = (
+                            f"⚠️ <b>Warning: Multiple Group Joins Detected</b>\n\n"
+                            f"হ্যালো {user_name}! আপনি একাধিকবার group এ join/leave করেছেন।\n\n"
+                            "🚫 <b>গুরুত্বপূর্ণ সতর্কতা:</b>\n"
+                            "❌ একজন user এর জন্য শুধুমাত্র একবার reward দেওয়া হয়\n"
+                            "🔄 আপনার এই rejoin attempt টি track করা হয়েছে\n"
+                            "⚠️ এই ধরনের behavior এর জন্য bot ban হতে পারে\n\n"
+                            "💡 <b>সঠিক নিয়ম:</b>\n"
+                            "✅ একবার group এ join করুন\n"
+                            "✅ Mini App ব্যবহার করুন\n"
+                            "✅ Rewards earn করুন\n\n"
+                            "🔒 <b>Bot Ban Policy:</b>\n"
+                            "🚫 Multiple rejoin attempts = Bot ban\n"
+                            "💸 Balance থাকলেও withdrawal বন্ধ\n"
+                            "🔒 Permanent restriction\n\n"
+                            "👉 <b>আর rejoin করবেন না!</b>"
+                        )
+
+                        await update.message.reply_text(
+                            warning_message,
+                            parse_mode='HTML'
+                        )
+                        # Continue to show Mini App but without processing reward
+                        print(f"⏭️ Skipping reward processing for rejoin attempt: {user_id}")
+                    else:
+                        # Process pending referral
+                        pending_query = referrals_ref.where('referred_id', '==', str(user_id)).where('status', '==', 'pending_group_join').limit(1)
+                        pending_referrals = list(pending_query.stream())
+
+                        if pending_referrals:
+                            referral_doc = pending_referrals[0]
+                            referral = referral_doc.to_dict()
+                            referrer_id = referral['referrer_id']
+
+                            # Check if reward has already been given (prevent multiple rewards)
+                            if referral.get('reward_given', False):
+                                print(f"⚠️ Reward already given for this referral: {referrer_id} → {user_id}")
+                                # Increment rejoin count and send warning
+                                current_rejoin_count = referral.get('rejoin_count', 0)
+                                referral_doc.reference.update({
+                                    'rejoin_count': current_rejoin_count + 1,
+                                    'last_rejoin_date': datetime.now(),
+                                    'updated_at': datetime.now()
+                                })
+
+                                # Send warning to user about rejoin attempt
+                                warning_message = (
+                                    f"⚠️ <b>Warning: Multiple Group Joins Detected</b>\n\n"
+                                    f"হ্যালো {user_name}! আপনি একাধিকবার group এ join/leave করেছেন।\n\n"
+                                    "🚫 <b>গুরুত্বপূর্ণ সতর্কতা:</b>\n"
+                                    "❌ একজন user এর জন্য শুধুমাত্র একবার reward দেওয়া হয়\n"
+                                    "🔄 আপনার এই rejoin attempt টি track করা হয়েছে\n"
+                                    "⚠️ এই ধরনের behavior এর জন্য bot ban হতে পারে\n\n"
+                                    "💡 <b>সঠিক নিয়ম:</b>\n"
+                                    "✅ একবার group এ join করুন\n"
+                                    "✅ Mini App ব্যবহার করুন\n"
+                                    "✅ Rewards earn করুন\n\n"
+                                    "🔒 <b>Bot Ban Policy:</b>\n"
+                                    "🚫 Multiple rejoin attempts = Bot ban\n"
+                                    "💸 Balance থাকলেও withdrawal বন্ধ\n"
+                                    "🔒 Permanent restriction\n\n"
+                                    "👉 <b>আর rejoin করবেন না!</b>"
+                                )
+
+                                await update.message.reply_text(
+                                    warning_message,
+                                    parse_mode='HTML'
+                                )
+                                return
+
+                            # Update referral status to verified and mark reward as given
+                            referral_doc.reference.update({
+                                'status': 'verified',
+                                'updated_at': datetime.now(),
+                                'is_active': True,
+                                'group_join_verified': True,
+                                'last_join_date': datetime.now(),
+                                'reward_given': True,
+                                'reward_given_at': datetime.now()
+                            })
+
+                            # Give reward to referrer (+2 taka)
+                            print(f"💰 Processing reward for referrer: {referrer_id}")
+
+                            # Get current balance and referral stats
+                            users_ref = db.collection('users')
+                            user_query = users_ref.where('telegram_id', '==', str(referrer_id)).limit(1)
+                            user_docs = list(user_query.stream())
+                            
+                            if user_docs:
+                                user_doc = user_docs[0]
+                                user_data = user_doc.to_dict()
+                                current_balance = user_data['balance']
+                                current_total_earnings = user_data.get('total_earnings', 0)
+                                current_total_referrals = user_data.get('total_referrals', 0)
+
+                                print(f"💰 Referrer current stats:")
+                                print(f"   Balance: {current_balance}")
+                                print(f"   Total Earnings: {current_total_earnings}")
+                                print(f"   Total Referrals: {current_total_referrals}")
+
+                                # Calculate new values
+                                new_balance = current_balance + 2
+                                new_total_earnings = current_total_earnings + 2
+                                new_total_referrals = current_total_referrals + 1
+
+                                print(f"💰 New stats will be:")
+                                print(f"   Balance: {current_balance} -> {new_balance}")
+                                print(f"   Total Earnings: {current_total_earnings} -> {new_total_earnings}")
+                                print(f"   Total Referrals: {current_total_referrals} -> {new_total_referrals}")
+
+                                # Update balance, total_earnings, and total_referrals
+                                user_doc.reference.update({
+                                    'balance': new_balance,
+                                    'total_earnings': new_total_earnings,
+                                    'total_referrals': new_total_referrals
+                                })
+
+                                # Create earnings record for referral reward
+                                earnings_ref = db.collection('earnings')
+                                earnings_ref.add({
+                                    'user_id': str(referrer_id),
+                                    'source': 'referral',
+                                    'amount': 2,
+                                    'description': f'Referral reward for user {user_name} (ID: {user_id})',
+                                    'reference_id': referral_doc.id,
+                                    'reference_type': 'referral',
+                                    'created_at': datetime.now()
+                                })
+
+                                print(f"💰 Earnings record created for referral reward")
+
+                                # Verify the update
+                                updated_user_docs = list(user_query.stream())
+                                if updated_user_docs:
+                                    updated_user_data = updated_user_docs[0].to_dict()
+                                    actual_balance = updated_user_data['balance']
+                                    actual_total_earnings = updated_user_data.get('total_earnings', 0)
+                                    actual_total_referrals = updated_user_data.get('total_referrals', 0)
+
+                                    print(f"💰 Actual stats after update:")
+                                    print(f"   Balance: {actual_balance} (expected: {new_balance})")
+                                    print(f"   Total Earnings: {actual_total_earnings} (expected: {new_total_earnings})")
+                                    print(f"   Total Referrals: {actual_total_referrals} (expected: {new_total_referrals})")
+
+                                    if (actual_balance == new_balance and
+                                        actual_total_earnings == new_total_earnings and
+                                        actual_total_referrals == new_total_referrals):
+                                        print(f"✅ All updates successful: {current_balance} → {actual_balance}")
+                                    else:
+                                        print(f"❌ Some updates failed! Expected: {new_balance}, Got: {actual_balance}")
+                                else:
+                                    print(f"❌ Could not verify balance update for referrer: {referrer_id}")
+                            else:
+                                print(f"❌ Could not get current balance for referrer: {referrer_id}")
+
+                            # Send notification to referrer
+                            notifications_ref = db.collection('notifications')
+                            notifications_ref.add({
+                                'user_id': str(referrer_id),
+                                'type': 'reward',
+                                'title': 'Referral Reward Earned! 🎉',
+                                'message': f'User {user_name} joined the group! You earned ৳2.',
+                                'read': False,
+                                'created_at': datetime.now()
+                            })
+
+                            print(f"💰 Referral reward processed: {referrer_id} got ৳2 for {user_name}")
                     referral = referral_doc.to_dict()
                     referrer_id = referral['referrer_id']
 
@@ -825,53 +1031,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         )
         
-        # Enhanced welcome message with Bangla text and image
+        # Show welcome message with image for group members
         image_url = "https://i.postimg.cc/44DtvWyZ/43b0363d-525b-425c-bc02-b66f6d214445-1.jpg"
         
-        # Check if this is a rejoin attempt and show appropriate message
-        if rejoin_check['is_rejoin']:
-            print(f"⚠️ Rejoin attempt detected for user {user_id}")
-            caption = (
-                f"⚠️ <b>সতর্কতা: পুনরায় Join সনাক্ত করা হয়েছে!</b>\n\n"
-                f"হ্যালো {user_name}! আপনি আগেও এই group এ ছিলেন।\n\n"
-                "🚫 <b>গুরুত্বপূর্ণ তথ্য:</b>\n"
-                "❌ একই ব্যক্তির জন্য শুধুমাত্র একবার referral reward দেওয়া হয়\n"
-                "📊 আপনার পূর্ববর্তী activity track করা হয়েছে\n"
-                "🔍 Admin panel এ সব তথ্য সংরক্ষিত আছে\n\n"
-                "💡 <b>নিয়মাবলী:</b>\n"
-                "✅ আপনি Mini App ব্যবহার করতে পারবেন\n"
-                "❌ কিন্তু referrer কোনো reward পাবেন না\n"
-                "⚠️ Multiple rejoin attempts bot ban এর কারণ হতে পারে\n\n"
-                "📱 <b>Admin Tracking Info:</b>\n"
-                f"🆔 User ID: {user_id}\n"
-                f"👤 Username: {username}\n"
-                f"📅 Previous Records: {len(rejoin_check['previous_records'])}\n\n"
-                "👉 Mini App এ access নিন কিন্তু সতর্ক থাকুন!"
-            )
-        else:
-            caption = (
-                f"🎉 <b>স্বাগতম {user_name}!</b>\n\n"
-                "🏆 <b>Cash Points এ আপনাকে স্বাগতম!</b>\n\n"
-                "💰 <b>আয়ের সুযোগ:</b>\n"
-                "✅ কোনো বিনিয়োগ ছাড়াই টাকা আয় করুন\n"
-                "👥 বন্ধুদের রেফার করুন - প্রতি রেফারে ৳২\n"
-                "🎯 সহজ টাস্ক সম্পন্ন করুন\n"
-                "🚀 লেভেল বাড়িয়ে আরও বেশি আয় করুন\n\n"
-                "📊 <b>আপনার তথ্য:</b>\n"
-                f"🆔 User ID: {user_id}\n"
-                f"👤 Username: @{username}\n"
-                f"📅 Group Join: {membership_info['join_date'].strftime('%d/%m/%Y %H:%M')}\n"
-                f"🏷️ Status: {membership_info['status']}\n\n"
-                "⚠️ <b>গুরুত্বপূর্ণ নিয়ম:</b>\n"
-                "🔒 Group ছেড়ে দিলে withdrawal বন্ধ হবে\n"
-                "💸 শুধুমাত্র group member রা withdrawal করতে পারবে\n"
-                "📱 Admin panel এ সব activity track করা হয়\n\n"
-                "👉 এখনই Mini App খুলুন এবং আয় শুরু করুন!"
-            )
+        caption = (
+            f"🎉 <b>স্বাগতম {user_name}!</b>\n\n"
+            "🏆 <b>রিওয়ার্ড অর্জন এখন আরও সহজ!</b>\n\n"
+            "✅ কোনো ইনভেস্টমেন্ট ছাড়াই প্রতিদিন জিতে নিন রিওয়ার্ড।\n"
+            "👥 শুধু টেলিগ্রামে মেম্বার অ্যাড করুন,\n"
+            "🎯 সহজ কিছু টাস্ক সম্পন্ন করুন আর\n"
+            "🚀 লেভেল আপ করুন।\n\n"
+            "📈 প্রতিটি লেভেলেই থাকছে বাড়তি বোনাস এবং নতুন সুবিধা।\n"
+            "💎 যত বেশি সক্রিয় হবেন, তত বেশি রিওয়ার্ড আপনার হাতে।\n\n"
+            "⚠️ <b>গুরুত্বপূর্ণ নিয়ম:</b>\n"
+            "🔒 Group এ join না করলে withdrawal দেওয়া হবে না\n"
+            "💰 শুধুমাত্র group member রা withdrawal করতে পারবে\n\n"
+            "👉 এখনই শুরু করুন এবং আপনার রিওয়ার্ড ক্লেইম করুন!"
+        )
         
         keyboard = [
-            [InlineKeyboardButton("🚀 Mini App খুলুন", url="https://super-donut-5e4873.netlify.app/")],
-            [InlineKeyboardButton("📊 Group Info", callback_data="group_info")]
+            [InlineKeyboardButton("Open and Earn 💰", url="https://super-donut-5e4873.netlify.app/")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -906,35 +1085,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         else:
                             raise schema_error
                 else:
-                    # Create new user with comprehensive data - FIXED: Use string ID and match frontend structure
-                    user_fingerprint = create_user_fingerprint(user_id, username, user_name)
+                    # Create new user
                     new_user_data = {
-                        'telegram_id': str(user_id),            # FIXED: Convert to string
+                        'telegram_id': user_id,
                         'username': username,
                         'first_name': user_name,
                         'last_name': update.message.from_user.last_name or "",
                         'created_at': datetime.now(),
-                        'updated_at': datetime.now(),           # FIXED: Add frontend expected field
                         'balance': 0,
                         'energy': 100,
-                        'max_energy': 100,                      # FIXED: Add frontend expected field
                         'level': 1,
                         'experience_points': 0,
-                        'mining_power': 0,                      # FIXED: Add frontend expected field
-                        'claim_streak': 0,                      # FIXED: Add frontend expected field
-                        'is_verified': False,                   # FIXED: Add frontend expected field
-                        'is_banned': False,                     # FIXED: Add frontend expected field
-                        'referral_code': ensure_user_referral_code(user_id, username),
-                        'referred_by': None,                    # FIXED: Add frontend expected field
-                        'group_join_date': membership_info['join_date'],
-                        'group_status': membership_info['status'],
-                        'user_fingerprint': user_fingerprint,
-                        'is_rejoin': rejoin_check['is_rejoin'],
-                        'rejoin_count': len(rejoin_check['previous_records']),
-                        'last_activity': datetime.now(),
-                        'last_active': datetime.now(),          # FIXED: Add frontend expected field
-                        'total_referrals': 0,
-                        'total_earnings': 0
+                        'referral_code': ensure_user_referral_code(user_id, username)
                     }
                     
                     # Try to add is_active if field exists
@@ -953,53 +1115,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"❌ Error updating user data: {e}")
     else:
-        # Enhanced join requirement message with Bangla text and image
+        # User is not member - show join requirement with image
         image_url = "https://i.postimg.cc/44DtvWyZ/43b0363d-525b-425c-bc02-b66f6d214445-1.jpg"
         
-        # Check if this user has previous records (rejoin attempt while not member)
-        if rejoin_check['is_rejoin']:
-            caption = (
-                f"🔒 <b>Group পুনরায় Join করুন</b>\n\n"
-                f"হ্যালো {user_name}! আপনি আগে এই group এর সদস্য ছিলেন।\n\n"
-                "📊 <b>Admin Tracking Info:</b>\n"
-                f"🆔 User ID: {user_id}\n"
-                f"👤 Username: @{username}\n"
-                f"📅 Previous Records: {len(rejoin_check['previous_records'])}\n"
-                f"🔍 Fingerprint: {rejoin_check['fingerprint'][:8]}...\n\n"
-                "⚠️ <b>গুরুত্বপূর্ণ তথ্য:</b>\n"
-                "❌ আপনার পূর্ববর্তী সব activity track করা আছে\n"
-                "🚫 Multiple join/leave attempts suspicious\n"
-                "📱 Admin panel এ সব তথ্য সংরক্ষিত\n\n"
-                "💡 <b>করণীয়:</b>\n"
-                "✅ Group এ join করুন এবং থাকুন\n"
-                "❌ বার বার leave/join করবেন না\n"
-                "⚠️ Suspicious activity = Bot ban\n\n"
-                "👉 <b>এখনই group এ join করুন!</b>"
-            )
-        else:
-            caption = (
-                f"🔒 <b>Group Join আবশ্যক</b>\n\n"
-                f"হ্যালো {user_name}! Cash Points Mini App ব্যবহার করতে আমাদের group এ join করতে হবে।\n\n"
-                "📋 <b>প্রয়োজনীয় ধাপ:</b>\n"
-                "1️⃣ নিচের button এ click করুন\n"
-                "2️⃣ Group এ join করুন\n"
-                "3️⃣ 'আমি Join করেছি' button এ click করুন\n"
-                "4️⃣ Mini App access পাবেন\n\n"
-                "💰 <b>আয়ের সুবিধা:</b>\n"
-                "🎁 প্রতিদিন reward পাবেন\n"
-                "👥 বন্ধু রেফার করে ৳২ পাবেন\n"
-                "🎯 সহজ টাস্ক করে টাকা আয়\n"
-                "🚀 Level up করে আরও বেশি আয়\n"
-                "💎 Real money withdrawal\n\n"
-                "📊 <b>আপনার তথ্য:</b>\n"
-                f"🆔 User ID: {user_id}\n"
-                f"👤 Username: @{username}\n\n"
-                "⚠️ <b>গুরুত্বপূর্ণ নিয়ম:</b>\n"
-                "🚫 Group ছাড়লে withdrawal বন্ধ\n"
-                "💸 শুধু group member রা withdrawal পারবে\n"
-                "📱 সব activity admin panel এ track হয়\n\n"
-                "👉 <b>এখনই group এ join করুন!</b>"
-            )
+        caption = (
+            f"🔒 <b>Group Join Required</b>\n\n"
+            f"হ্যালো {user_name}! Mini App access পেতে আমাদের group এ join করতে হবে।\n\n"
+            "📋 <b>Requirements:</b>\n"
+            "✅ Group এ join করুন\n"
+            "✅ তারপর /start কমান্ড দিন\n"
+            "✅ Mini App access পাবেন\n\n"
+            "💰 <b>Benefits:</b>\n"
+            "🎁 Daily rewards\n"
+            "🎯 Easy tasks\n"
+            "🚀 Level up system\n"
+            "💎 Real money earnings\n\n"
+            "⚠️ <b>গুরুত্বপূর্ণ সতর্কতা:</b>\n"
+            "🚫 Group এ join না করলে withdrawal দেওয়া হবে না\n"
+            "💸 আপনার balance থাকলেও withdrawal করতে পারবেন না\n"
+            "🔒 শুধুমাত্র group member রা withdrawal করতে পারবে\n\n"
+            "👉 <b>Join the group now!</b>"
+        )
         
         keyboard = [
             [InlineKeyboardButton(f"📱 {REQUIRED_GROUP_NAME} এ Join করুন", url=REQUIRED_GROUP_LINK)],
@@ -1133,8 +1269,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                             # Continue to show Mini App but without processing reward
                             print(f"⏭️ Skipping reward processing for rejoin attempt via callback: {user_id}")
                         else:
-                            # Process pending referral - FIXED: Use string ID and frontend status
-                            pending_query = referrals_ref.where('referred_id', '==', str(user_id)).where('status', '==', 'pending').limit(1)
+                            # Process pending referral
+                            pending_query = referrals_ref.where('referred_id', '==', user_id).where('status', '==', 'pending_group_join').limit(1)
                             pending_referrals = list(pending_query.stream())
 
                             if pending_referrals:
@@ -1278,32 +1414,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
                                 print(f"💰 Referral reward processed via callback: {referrer_id} got ৳2")
                         
-                        # Enhanced success message with Bangla text
-                        if rejoin_check['is_rejoin']:
-                            success_message = (
-                                f"⚠️ <b>পুনরায় Join সনাক্ত - {user_name}</b>\n\n"
-                                "✅ Group membership verified!\n"
-                                "🚫 <b>Rejoin Warning:</b>\n"
-                                "❌ এটি একটি rejoin attempt\n"
-                                "📊 আপনার পূর্ববর্তী records আছে\n"
-                                "💰 Referrer কোনো reward পাবেন না\n\n"
-                                "📱 <b>Admin Tracking:</b>\n"
-                                f"🆔 User ID: {user_id}\n"
-                                f"📅 Records: {len(rejoin_check['previous_records'])}\n\n"
-                                "👉 Mini App access আছে কিন্তু সতর্ক থাকুন!"
-                            )
-                        else:
-                            success_message = (
-                                f"🎉 <b>স্বাগতম {user_name}!</b>\n\n"
-                                "✅ Group membership verified!\n"
-                                "💰 <b>Referral Processing:</b>\n"
-                                "🔗 আপনার referrer ৳2 পেয়েছেন\n"
-                                "🎁 আপনি এখন Mini App ব্যবহার করতে পারবেন\n\n"
-                                "📊 <b>আপনার তথ্য:</b>\n"
-                                f"🆔 User ID: {user_id}\n"
-                                f"📅 Join Date: {membership_info['join_date'].strftime('%d/%m/%Y %H:%M')}\n\n"
-                                "👉 নিচের button এ click করে আয় শুরু করুন!"
-                            )
+                        # Success message
+                        success_message = (
+                            f"🎉 <b>Welcome {user_name}!</b>\n\n"
+                            "✅ Group membership verified!\n"
+                            "🎁 You can now access the Mini App\n\n"
+                            "👉 Click the button below to start earning!"
+                        )
                         
                         keyboard = [
                             [InlineKeyboardButton("Open and Earn 💰", url="https://super-donut-5e4873.netlify.app/")]
